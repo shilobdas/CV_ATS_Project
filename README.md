@@ -115,6 +115,4 @@ pip install -r requirements.txt
 - DOCX output alongside PDF
 - Swap `ollama.generate` for a config-driven model choice (local or API)
 
-## License
 
-Private project — add a license here if you plan to share this publicly.
