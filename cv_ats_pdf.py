@@ -21,7 +21,7 @@ from reportlab.pdfbase.pdfmetrics import stringWidth
 # CONFIGURATION
 # ============================================================
 
-MODEL = "llama3.1:8b"
+MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:8b")
 
 BASE_DIR = Path(__file__).resolve().parent
 INPUT_DIR = BASE_DIR / "input"
@@ -47,6 +47,10 @@ BANNER_WIDTH_RATIO = 0.85
 # width before it is accepted as a real column gutter.
 MIN_GUTTER_RATIO = 0.025
 
+# Resolution used only when a PDF page has no embedded text and must be
+# rasterized for OCR. 300 DPI is a good balance for resume-sized type.
+OCR_DPI = 300
+
 
 def _block_text(block) -> str:
     """
@@ -70,12 +74,12 @@ def _block_text(block) -> str:
     return "\n".join(lines)
 
 
-def _collect_blocks(page):
+def _collect_blocks(page, textpage=None):
     """
     Return every non-empty text block on the page with its position.
     """
 
-    raw = page.get_text("dict")
+    raw = page.get_text("dict", textpage=textpage)
 
     blocks = []
 
@@ -103,6 +107,122 @@ def _collect_blocks(page):
         )
 
     return blocks
+
+
+def _configure_tessdata() -> None:
+    """Locate Tesseract language data for PyMuPDF's OCR integration."""
+
+    configured = os.environ.get("TESSDATA_PREFIX")
+
+    if configured and Path(configured).is_dir():
+        return
+
+    candidates = []
+
+    for variable in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+        root = os.environ.get(variable)
+
+        if not root:
+            continue
+
+        if variable == "LOCALAPPDATA":
+            candidates.append(
+                Path(root) / "Programs" / "Tesseract-OCR" / "tessdata"
+            )
+        else:
+            candidates.append(Path(root) / "Tesseract-OCR" / "tessdata")
+
+    for candidate in candidates:
+        if candidate.is_dir():
+            os.environ["TESSDATA_PREFIX"] = str(candidate)
+            return
+
+
+def _ocr_textpage(page):
+    """Return a positioned OCR text page for an image-only PDF page."""
+
+    _configure_tessdata()
+
+    try:
+        return page.get_textpage_ocr(
+            language="eng",
+            dpi=OCR_DPI,
+            full=True,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "This PDF page contains no embedded text and OCR could not run. "
+            "Install Tesseract OCR with English language data, or set "
+            "TESSDATA_PREFIX to its tessdata directory. "
+            f"OCR error: {exc}"
+        ) from exc
+
+
+def _find_scanned_page_gutter(page):
+    """Find a persistent vertical whitespace gutter in a scanned page."""
+
+    pix = page.get_pixmap(colorspace=pymupdf.csGRAY, alpha=False)
+    width = pix.width
+    height = pix.height
+    samples = pix.samples
+
+    # Ignore the title/header area, where text commonly spans both columns.
+    body_top = int(height * 0.16)
+    body_bottom = int(height * 0.95)
+    max_ink = max(4, int((body_bottom - body_top) * 0.008))
+
+    ink_counts = []
+
+    for x in range(width):
+        count = sum(
+            samples[(y * width) + x] < 200
+            for y in range(body_top, body_bottom)
+        )
+        ink_counts.append(count)
+
+    search_left = int(width * 0.15)
+    search_right = int(width * 0.85)
+    runs = []
+    start = None
+
+    for x in range(search_left, search_right + 1):
+        low_ink = x < search_right and ink_counts[x] <= max_ink
+
+        if low_ink and start is None:
+            start = x
+        elif not low_ink and start is not None:
+            runs.append((start, x))
+            start = None
+
+    min_width = width * MIN_GUTTER_RATIO
+    max_width = width * 0.15
+    candidates = [
+        (end - start, start, end)
+        for start, end in runs
+        if min_width <= end - start <= max_width
+    ]
+
+    if not candidates:
+        return None
+
+    _, start, end = max(candidates)
+    return page.rect.x0 + (((start + end) / 2) / width) * page.rect.width
+
+
+def _ocr_clip_text(page, clip) -> str:
+    """OCR one clipped page region and return its plain text."""
+
+    pix = page.get_pixmap(dpi=OCR_DPI, clip=clip, alpha=False)
+    ocr_pdf = pymupdf.open(
+        "pdf",
+        pix.pdfocr_tobytes(language="eng"),
+    )
+
+    try:
+        ocr_page = ocr_pdf[0]
+        return ocr_page.get_text("text").strip()
+    finally:
+        ocr_pdf.close()
 
 
 def _find_gutter(blocks, content_left, content_right):
@@ -189,10 +309,57 @@ def _extract_page(page, page_number: int) -> str:
     blocks = _collect_blocks(page)
 
     if not blocks:
-        return (
-            f"--- PAGE {page_number} ---\n"
-            "[NO TEXT EXTRACTED - POSSIBLY SCANNED/IMAGE PDF]"
-        )
+        print(f"Page {page_number}: no embedded text; running OCR...")
+        _configure_tessdata()
+        image_gutter = _find_scanned_page_gutter(page)
+
+        if image_gutter is not None:
+            header_bottom = page.rect.y0 + page.rect.height * 0.16
+            regions = (
+                (
+                    "PAGE HEADER",
+                    pymupdf.Rect(
+                        page.rect.x0,
+                        page.rect.y0,
+                        page.rect.x1,
+                        header_bottom,
+                    ),
+                ),
+                (
+                    "LEFT COLUMN",
+                    pymupdf.Rect(
+                        page.rect.x0,
+                        header_bottom,
+                        image_gutter,
+                        page.rect.y1,
+                    ),
+                ),
+                (
+                    "RIGHT COLUMN",
+                    pymupdf.Rect(
+                        image_gutter,
+                        header_bottom,
+                        page.rect.x1,
+                        page.rect.y1,
+                    ),
+                ),
+            )
+            parts = []
+
+            for label, clip in regions:
+                text = _ocr_clip_text(page, clip)
+
+                if text:
+                    parts.append(f"[{label} - OCR]\n{text}")
+
+            if parts:
+                return f"--- PAGE {page_number} ---\n" + "\n\n".join(parts)
+
+        ocr_textpage = _ocr_textpage(page)
+        blocks = _collect_blocks(page, textpage=ocr_textpage)
+
+    if not blocks:
+        return f"--- PAGE {page_number} ---\n[OCR FOUND NO TEXT]"
 
     content_left = min(b["x0"] for b in blocks)
     content_right = max(b["x1"] for b in blocks)
@@ -326,8 +493,9 @@ def read_pdf(file_path):
     there is a real column gutter, and emits one whole column at a
     time.
 
-    Works for text-based PDFs.
-    Scanned/image-only PDFs will require OCR.
+    Text-based PDFs are extracted directly. Scanned/image-only pages
+    automatically fall back to local Tesseract OCR while preserving word
+    positions for the same column-ordering logic.
     """
 
     try:
@@ -454,13 +622,58 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
+def prepare_cv_for_model(text: str) -> str:
+    """Remove OCR layout labels and obvious decorative noise before prompting."""
+
+    cleaned_lines = []
+    noise_words = {"q", "ty", "ws", "ti", "mat", "-_"}
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+
+        if not line:
+            cleaned_lines.append("")
+            continue
+
+        if re.match(r"^---\s*PAGE\s+\d+\s*---$", line, re.IGNORECASE):
+            continue
+
+        if re.match(
+            r"^\[(PAGE HEADER|LEFT COLUMN|RIGHT COLUMN).*OCR\]$",
+            line,
+            re.IGNORECASE,
+        ):
+            continue
+
+        if line.lower() in noise_words:
+            continue
+
+        # Tesseract commonly reads graphical skill-rating circles as long
+        # repetitions of O/Q/R/@ and mojibake symbols.
+        if re.search(r"(?:OR){3}|(?:OQ){2}|[@Ââ€™®©]{3}", line, re.IGNORECASE):
+            continue
+
+        if line.lower() == "e":
+            cleaned_lines.append("-")
+            continue
+
+        line = re.sub(r"^\$?\d+\s+KEY SKILLS$", "KEY SKILLS", line, flags=re.I)
+        line = re.sub(r"^\d+\.\s+SUMMARY$", "SUMMARY", line, flags=re.I)
+        line = re.sub(r"\b250kK\+", "250K+", line)
+        cleaned_lines.append(line)
+
+    cleaned = "\n".join(cleaned_lines)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
 # ============================================================
 # LLM PROMPT
 # ============================================================
 
 def build_rewrite_prompt(cv_text: str, job_description: str = "") -> str:
     """
-    Build a prompt that asks Llama to REWRITE the CV directly into
+    Build a prompt that asks the language model to rewrite the CV directly into
     ATS-friendly text, in a strict, easy-to-parse plain-text layout.
 
     The output of this prompt is the final CV content. It gets
@@ -475,171 +688,58 @@ def build_rewrite_prompt(cv_text: str, job_description: str = "") -> str:
         else "No job description provided."
     )
 
-    return f"""
-You are an ATS resume formatting and rewriting assistant.
+    return f"""Rewrite this CV as the final plain-text ATS resume. Output the
+resume only: no analysis, instructions, Markdown, or placeholders. Use only
+stated facts and omit any missing name or field. Use uppercase section headings,
+"Title | Company | Dates" for jobs, and "- " bullets for duties and skills.
+Job target: {jd_block}
 
-Your job is to take the candidate's existing CV (extracted below,
-possibly out of visual order because it came from a PDF) and rewrite
-it as a clean, single-column, ATS-friendly resume.
-
-============================================================
-FACTUAL ACCURACY RULES
-============================================================
-
-1. NEVER invent information.
-
-2. NEVER invent:
-   - numbers, percentages, or performance improvements
-   - achievements, responsibilities, or business results
-   - technologies, certifications, or projects
-   - job titles, company names, or dates
-   - education details, including GPA
-
-3. NEVER change the candidate's actual job title.
-
-4. NEVER convert a job-description requirement into candidate
-   experience unless the original CV explicitly supports it.
-
-5. If a measurable result is not present in the original CV,
-   DO NOT create one.
-
-6. You may improve grammar and wording, but the meaning must stay
-   factually equivalent to the original statement.
-
-7. Do not increase the apparent seniority or responsibility of the
-   candidate.
-
-8. Preserve all factual information from the original CV, including
-   GPA, minor details, and secondary contact fields.
-
-9. Remove information that is normally unnecessary for an ATS
-   resume: Date of Birth, Nationality, Marital Status, a photo, and
-   a References section.
-
-10. Do not remove useful professional contact information: name,
-    phone, email, location, LinkedIn, GitHub, or website.
-
-============================================================
-JOB DESCRIPTION RULES
-============================================================
-
-11. Analyze the job description (if provided) for relevant
-    keywords.
-
-12. A keyword may be added to the Skills section ONLY if the
-    candidate's original CV already demonstrates that skill.
-
-13. Do not add unsupported technologies or experience merely
-    because they appear in the job description.
-
-14. If the job description asks for something missing from the CV,
-    do NOT pretend the candidate has it.
-
-============================================================
-OUTPUT FORMAT - FOLLOW EXACTLY
-============================================================
-
-Do not use Markdown anywhere. No **, no *, no #, no tab characters,
-no smart bullets. Plain text only. The single marker "- " (hyphen,
-then one space) is the only bullet marker allowed, ever.
-
-Line 1: the candidate's full name, nothing else.
-
-Line 2: one line of contact info, pipe-separated, containing ONLY the
-fields that are actually present in the original CV. Order when
-present: Phone: xxx | Email: xxx | Location: xxx | LinkedIn: xxx |
-GitHub: xxx | Website: xxx
-
-If a field is missing from the original CV, do not write its label
-at all. Never write placeholder values such as "(not present)",
-"N/A", "None", "not provided", or "-" for a missing field. A missing
-field simply does not appear on the line.
-
-Example - if the CV has no LinkedIn or GitHub:
-Correct:   Phone: 123-456-7890 | Email: hello@site.com | Location: Any City
-Incorrect: Phone: 123-456-7890 | Email: hello@site.com | Location: Any City | LinkedIn: (not present) | GitHub: (not present)
-
-Leave one blank line after the contact line, then the sections.
-
-Use ONLY these section headings, in ALL CAPS, each alone on its own
-line, no punctuation, no numbering. Skip any section the original CV
-has no content for. Do not invent a section name that is not in this
-list:
-PROFESSIONAL SUMMARY
-TECHNICAL SKILLS
-PROFESSIONAL EXPERIENCE
-EDUCATION
-PROJECTS
-CERTIFICATIONS
-ACHIEVEMENTS
-LANGUAGES
-
-Under PROFESSIONAL EXPERIENCE, write each role in EXACTLY this
-three-part shape, with a blank line between roles:
-Job Title | Company Name | Start Date - End Date
-- bullet point
-- bullet point
-
-Under EDUCATION, write each entry in EXACTLY this shape:
-Degree | Institution | Start Date - End Date
-GPA: x.x / x.x
-(omit the GPA line entirely if the original CV has no GPA)
-
-Under TECHNICAL SKILLS, write one skill per line, each starting with
-"- ".
-
-Under PROJECTS, CERTIFICATIONS, ACHIEVEMENTS, or LANGUAGES, write one
-item per line, each starting with "- ".
-
-PROFESSIONAL SUMMARY is a short paragraph, not bullets.
-
-============================================================
-TARGET JOB DESCRIPTION
-============================================================
-
-{jd_block}
-
-============================================================
-ORIGINAL CV (may be out of visual order - use headings, dates and
-context to figure out which bullets belong to which job)
-============================================================
-
-{cv_text}
-
-============================================================
-
-Return ONLY the rewritten resume text in the exact format described
-above. No preamble, no explanation, no code fences.
-"""
+CV:
+{cv_text}"""
 
 
 # ============================================================
-# CALL LLAMA
+# CALL LOCAL OLLAMA
 # ============================================================
 
-def generate_ats_text(cv_text: str, job_description: str = "") -> str:
+def generate_ats_text(
+    cv_text: str,
+    job_description: str = "",
+    retry_feedback: str = "",
+) -> str:
     """
-    Send the CV to Llama and get back rewritten, ATS-friendly plain
-    text (not JSON).
+    Send the CV to the local Ollama model and return ATS-friendly plain text.
     """
 
     prompt = build_rewrite_prompt(
-        cv_text=cv_text,
+        cv_text=prepare_cv_for_model(cv_text),
         job_description=job_description
     )
 
-    print("\nSending CV to Llama 3.1 8B...")
+    if retry_feedback:
+        prompt += (
+            "\n\nCORRECTION: The previous reply was rejected because "
+            f"{retry_feedback} Return the complete resume itself now; do not "
+            "return a placeholder or describe what the response should contain."
+        )
+
+    print(f"\nSending CV to local Ollama model {MODEL}...")
     print("This may take some time on CPU.\n")
 
-    response = ollama.generate(
-        model=MODEL,
-        prompt=prompt,
-        options={
-            "temperature": 0.2
-        }
-    )
+    try:
+        response = ollama.generate(
+            model=MODEL,
+            prompt=prompt,
+            options={"temperature": 0.2},
+        )
+        rewritten = response["response"].strip()
+    except Exception as exc:
+        raise RuntimeError(
+            f"Local Ollama request failed for model {MODEL}: {exc}"
+        ) from exc
 
-    rewritten = response["response"].strip()
+    if not rewritten:
+        raise RuntimeError("Ollama returned no usable text.")
 
     # Strip accidental Markdown code fences, if the model adds them
     # despite being told not to.
@@ -658,6 +758,38 @@ def generate_ats_text(cv_text: str, job_description: str = "") -> str:
     )
 
     return rewritten.strip()
+
+
+def validate_rewritten_text(rewritten_text: str) -> None:
+    """Reject empty, placeholder, or structurally incomplete model output."""
+
+    normalized = rewritten_text.strip()
+    lowered = normalized.lower()
+    placeholder_markers = (
+        "[formatted content]",
+        "[resume content]",
+        "[resume text]",
+        "insert resume",
+    )
+
+    if len(normalized) < 200:
+        raise RuntimeError(
+            f"Model output is too short to be a resume ({len(normalized)} characters)."
+        )
+
+    if any(marker in lowered for marker in placeholder_markers):
+        raise RuntimeError("Model returned placeholder text instead of a resume.")
+
+    heading_count = sum(
+        1
+        for line in normalized.splitlines()
+        if line.strip().lower().rstrip(":") in KNOWN_HEADINGS
+    )
+
+    if heading_count < 2:
+        raise RuntimeError(
+            "Model output is incomplete: fewer than two resume sections were found."
+        )
 
 
 # ============================================================
@@ -835,9 +967,67 @@ def _clean_contact_line(contact_line: str) -> str:
     return " | ".join(kept)
 
 
+def _looks_like_contact(line: str) -> bool:
+    """Return whether a header line contains contact-style fields."""
+
+    lowered = line.lower()
+    return any(
+        token in lowered
+        for token in (
+            "@", "phone", "email", "http", "linkedin", "github", "|", "+"
+        )
+    )
+
+
+def remove_unsupported_name(rewritten_text: str, source_text: str) -> str:
+    """Remove a model-generated header name not evidenced by the source CV."""
+
+    lines = rewritten_text.splitlines()
+    index = 0
+
+    while index < len(lines):
+        candidate = _normalize_line(lines[index])
+
+        if candidate and not PREAMBLE_RE.match(candidate):
+            break
+
+        index += 1
+
+    if index >= len(lines):
+        return rewritten_text
+
+    candidate = _normalize_line(lines[index])
+
+    if (
+        candidate.lower().rstrip(":") in KNOWN_HEADINGS
+        or _looks_like_contact(candidate)
+    ):
+        return rewritten_text
+
+    candidate_tokens = {
+        token.lower()
+        for token in re.findall(r"[A-Za-z]+", candidate)
+        if len(token) > 1
+    }
+    source_tokens = {
+        token.lower()
+        for token in re.findall(r"[A-Za-z]+", source_text)
+    }
+
+    if candidate_tokens and candidate_tokens.issubset(source_tokens):
+        return rewritten_text
+
+    print(
+        "WARNING: Removed an unsupported candidate name generated by the model: "
+        f"{candidate}"
+    )
+    del lines[index]
+    return "\n".join(lines).strip()
+
+
 def parse_ats_text(rewritten_text: str) -> dict:
     """
-    Parse Llama's rewritten CV text into a structure the DOCX/PDF
+    Parse the model's rewritten CV text into a structure the DOCX/PDF
     writers can render with real design (tab-aligned dates,
     underlined headings, etc.).
 
@@ -874,19 +1064,16 @@ def parse_ats_text(rewritten_text: str) -> dict:
         i += 1
 
     if i < n and lines[i].lower().rstrip(":") not in KNOWN_HEADINGS:
-        result["name"] = lines[i]
-        i += 1
+        if not _looks_like_contact(lines[i]):
+            result["name"] = lines[i]
+            i += 1
 
     while i < n and not lines[i]:
         i += 1
 
     if i < n and lines[i].lower().rstrip(":") not in KNOWN_HEADINGS:
 
-        looks_like_contact = any(
-            token in lines[i].lower()
-            for token in ("@", "phone", "email", "http", "linkedin",
-                          "github", "|", "+")
-        )
+        looks_like_contact = _looks_like_contact(lines[i])
 
         if looks_like_contact:
             result["contact"] = lines[i]
@@ -1228,7 +1415,7 @@ def _add_plain(doc, text: str):
 
 def write_ats_docx(rewritten_text: str, original_file: Path) -> Path:
     """
-    Parse Llama's rewritten CV text and render it into a properly
+    Parse the model's rewritten CV text and render it into a properly
     designed, single-column, ATS-friendly DOCX: centered name and
     contact block, underlined section headings, and right-aligned
     dates next to each job/education entry.
@@ -1522,7 +1709,7 @@ def _pdf_add_paragraph(cur: _PdfCursor, text: str):
 
 def write_ats_pdf(rewritten_text: str, original_file: Path) -> Path:
     """
-    Parse Llama's rewritten CV text and render it directly into a
+    Parse the model's rewritten CV text and render it directly into a
     single-column, ATS-friendly PDF - centered name and contact
     block, underlined section headings, right-aligned dates next to
     each job/education entry. Same layout as write_ats_docx, but no
@@ -1532,12 +1719,17 @@ def write_ats_pdf(rewritten_text: str, original_file: Path) -> Path:
 
     data = parse_ats_text(rewritten_text)
 
+    if not data["sections"]:
+        raise ValueError("Refusing to create a PDF with no resume sections.")
+
     output_path = (
         OUTPUT_DIR /
         f"{original_file.stem}_ATS_Friendly.pdf"
     )
 
-    c = pdf_canvas.Canvas(str(output_path), pagesize=LETTER)
+    temp_output_path = output_path.with_suffix(".tmp.pdf")
+
+    c = pdf_canvas.Canvas(str(temp_output_path), pagesize=LETTER)
     cur = _PdfCursor(c)
 
     if data["name"]:
@@ -1573,6 +1765,21 @@ def write_ats_pdf(rewritten_text: str, original_file: Path) -> Path:
                 _pdf_add_paragraph(cur, item["text"])
 
     c.save()
+
+    try:
+        with pymupdf.open(temp_output_path) as rendered:
+            page_count = len(rendered)
+            text_length = sum(len(page.get_text().strip()) for page in rendered)
+
+        if page_count < 1 or text_length < 1:
+            raise ValueError(
+                "Generated PDF validation failed: the document has no readable pages."
+            )
+
+        temp_output_path.replace(output_path)
+    except Exception:
+        temp_output_path.unlink(missing_ok=True)
+        raise
 
     return output_path
 
@@ -1721,20 +1928,39 @@ def main():
     )
 
     # ---------------------------------------
-    # Llama: rewrite into ATS-friendly text
+    # Language model: rewrite into ATS-friendly text
     # ---------------------------------------
 
-    rewritten_text = generate_ats_text(
-        cv_text,
-        job_description
-    )
+    try:
+        rewritten_text = generate_ats_text(
+            cv_text,
+            job_description
+        )
+    except RuntimeError as exc:
+        if "no usable text" not in str(exc).lower():
+            print(f"\nERROR: {exc}")
+            return
 
-    # Always keep a copy of what Llama actually returned, useful if
+        print(f"\nModel response rejected: {exc}")
+        print("Retrying the chat API once with corrective instructions...")
+
+        try:
+            rewritten_text = generate_ats_text(
+                cv_text,
+                job_description,
+                retry_feedback="the prior response contained reasoning only",
+            )
+        except RuntimeError as retry_exc:
+            print(f"\nERROR after retry: {retry_exc}")
+            print("The existing ATS-friendly PDF was not overwritten.")
+            return
+
+    # Always keep a copy of what the model actually returned, useful if
     # the DOCX/PDF step below needs debugging.
 
     raw_file = (
         OUTPUT_DIR /
-        f"{cv_file.stem}_llama_output.txt"
+        f"{cv_file.stem}_model_output.txt"
     )
 
     raw_file.write_text(
@@ -1745,7 +1971,7 @@ def main():
     if not rewritten_text:
 
         print(
-            "\nERROR: Llama returned an empty response."
+            "\nERROR: The language model returned an empty response."
         )
 
         print(
@@ -1753,6 +1979,40 @@ def main():
         )
 
         return
+
+    try:
+        validate_rewritten_text(rewritten_text)
+    except RuntimeError as exc:
+        print(f"\nModel response rejected: {exc}")
+        print("Retrying the chat API once with corrective instructions...")
+
+        try:
+            rewritten_text = generate_ats_text(
+                cv_text,
+                job_description,
+                retry_feedback=str(exc),
+            )
+        except RuntimeError as retry_exc:
+            print(f"\nERROR: {retry_exc}")
+            print("The existing ATS-friendly PDF was not overwritten.")
+            return
+
+        raw_file.write_text(
+            rewritten_text,
+            encoding="utf-8"
+        )
+
+        try:
+            validate_rewritten_text(rewritten_text)
+        except RuntimeError as retry_exc:
+            print(f"\nERROR after retry: {retry_exc}")
+            print("The existing ATS-friendly PDF was not overwritten.")
+            return
+
+    rewritten_text = remove_unsupported_name(
+        rewritten_text,
+        cv_text,
+    )
 
     # ---------------------------------------
     # Write plain ATS-friendly PDF

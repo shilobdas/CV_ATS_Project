@@ -5,8 +5,7 @@ into a clean, single-column, ATS-friendly resume — optionally tailored to a
 target job description — and renders it as a polished PDF.
 
 Everything runs locally. The CV never leaves your machine: text extraction,
-rewriting (via a local Llama model through [Ollama](https://ollama.com)),
-and PDF generation all happen on-device.
+rewriting through Ollama, and PDF generation all happen on-device.
 
 ---
 
@@ -23,7 +22,7 @@ and PDF generation all happen on-device.
  └────────┬───────────┘
           ▼
  ┌───────────────────┐
- │  LLM rewrite       │  Llama 3.1 8B (via Ollama, local inference)
+ │  LLM rewrite       │  Llama 3.1 8B through local Ollama
  │                    │  Rewrites the CV into a strict plain-text
  │                    │  format, optionally aligned to a job
  │                    │  description. Never invents facts.
@@ -61,9 +60,14 @@ that should never be committed.
 ## Prerequisites
 
 - Python 3.10+
-- [Ollama](https://ollama.com) installed and running locally, with the
-  `llama3.1:8b` model pulled:
-  ```bash
+- [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) with English
+  language data (required only for scanned/image-only PDFs). Common Windows
+  install locations are detected automatically; elsewhere, set
+  `TESSDATA_PREFIX` to the `tessdata` directory.
+- [Ollama](https://ollama.com) installed and running locally, with the default
+  model available:
+
+  ```powershell
   ollama pull llama3.1:8b
   ```
 
@@ -73,6 +77,12 @@ that should never be committed.
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+```
+
+The local model can be overridden when needed:
+
+```powershell
+$env:OLLAMA_MODEL = "llama3.1:8b"
 ```
 
 ## Usage
@@ -88,7 +98,7 @@ pip install -r requirements.txt
 5. Find the result in `output/`:
    - `<name>_ATS_Friendly.pdf` — the final resume
    - `<name>_extracted.txt` — raw extracted text (debugging)
-   - `<name>_llama_output.txt` — raw model output before parsing (debugging)
+   - `<name>_model_output.txt` — raw model output before parsing (debugging)
 
 ## Design notes
 
@@ -96,7 +106,7 @@ pip install -r requirements.txt
   model is explicitly told never to invent numbers, titles, dates, or
   skills, and job-description keywords are only added to Skills if the
   original CV already demonstrates them.
-- **Output parsing is deliberately forgiving.** Local 8B models don't
+- **Output parsing is deliberately forgiving.** Language models don't always
   follow formatting instructions perfectly. `parse_ats_text()` degrades
   gracefully — unrecognized lines become plain paragraphs instead of being
   dropped — so nothing from the original CV silently disappears.
@@ -111,8 +121,6 @@ pip install -r requirements.txt
 
 ## Roadmap ideas
 
-- OCR fallback for scanned/image-only PDFs
 - DOCX output alongside PDF
-- Swap `ollama.generate` for a config-driven model choice (local or API)
 
 
